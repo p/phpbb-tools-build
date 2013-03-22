@@ -1,0 +1,26 @@
+#!/bin/sh
+
+set -e
+
+target="$1"
+
+genp() {
+	for branch in develop olympus; do
+		for db in mysql mysqli postgres; do
+			for target in unit functional wolis; do
+				echo "$target-$branch-$db"
+			done
+		done
+	done
+}
+
+for project in \
+	`genp` \
+	unit-develop-nodb \
+	unit-olympus-nodb \
+; do
+	if test -z "$target" || echo $project |grep -q ^"$target"; then
+		echo "Rebuilding $project"
+		curl -nX POST http://integrity.vps.hxr.me/$project/builds
+	fi
+done

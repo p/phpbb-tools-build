@@ -1,0 +1,288 @@
+#!/usr/bin/env perl
+package PHPBB::Git;
+
+use strict;
+use warnings;
+
+sub commits_in_branch($) {
+    my ($branch) = @_;
+    my @commits_in_branch = ();
+    
+    open CMD, qq/git log --pretty=oneline "$branch" |/;
+    while (<CMD>) {
+        my @parts = split ' ', $_, 2;
+        my $sha = $parts[0];
+        push @commits_in_branch, $sha;
+    }
+    close CMD;
+    
+    @commits_in_branch;
+}
+
+sub shortlog($) {
+    my ($branch) = @_;
+    my @commits_in_branch = ();
+    my %meta = ();
+    
+    open CMD, qq/git log --pretty=oneline "$branch" |/;
+    while (<CMD>) {
+        my @parts = split ' ', $_, 2;
+        my $sha = $parts[0];
+        push @commits_in_branch, $sha;
+        $meta{$sha} = $parts[1];
+    }
+    close CMD;
+    
+    (\@commits_in_branch, \%meta);
+}
+
+sub head_commit($) {
+    my ($branch) = @_;
+    my $head_commit;
+    
+    open CMD, qq/git log --pretty=oneline -1 "$branch" |/;
+    while (<CMD>) {
+        my @parts = split ' ';
+        $head_commit = $parts[0];
+    }
+    close CMD;
+    
+    $head_commit;
+}
+
+sub determine_base {
+    my ($branch, $prefix, $branch_commits) = @_;
+    my @branch_commits;
+    unless (defined $prefix) {
+        $prefix = '';
+    }
+    if (defined $branch_commits) {
+        @branch_commits = @{$branch_commits};
+    } else {
+        @branch_commits = commits_in_branch($branch);
+    }
+    # Important: base list should be arranged in the same order
+    # in which merges are done.
+    my @bases = qw/develop-olympus develop/;
+    my %base_commits = ();
+    for my $base (@bases) {
+        my @commits = commits_in_branch($prefix . $base);
+        my %commits_hash = ();
+        for (@commits) {
+            $commits_hash{$_} = 1;
+        }
+        $base_commits{$base} = \%commits_hash;
+    }
+    
+    for my $sha (@branch_commits) {
+        for my $base (@bases) {
+            if ($base_commits{$base}->{$sha}) {
+                return $prefix . $base;
+            }
+        }
+    }
+    undef;
+}
+
+1;
+#!/usr/bin/env perl
+
+# Usage:
+#
+# Initial merge:
+#
+# phpbb-merge galaxyAbstractor/ticket/10836 771
+# phpbb-merge galaxyAbstractor/ticket/10836 771 develop-olympus
+# phpbb-merge galaxyAbstractor/ticket/10836 771 o
+#
+# The first argument is branch name, the second argument is PR number
+# to be included in merge commit message, the third argument is target branch.
+#
+# Target branch can be omitted, in which case it will be figured out
+# based on the ancestry of the branch being merged. Specifying target branch
+# is most useful when merging into prep-release branches.
+#
+# Branch name can be omitted also, in which case it will be derived from
+# the PR via github api. Internet access is required for this to work.
+#
+# Merging develop-olympus into develop:
+#
+# phpbb-merge -d
+#
+# This should also work for forwarding merges from prep-release-* to
+# develop-olympus. -d will forward until it reaches develop.
+#
+# The last useful option is -n for --no-commit. This will stop before
+# committing the merge as the corresponding option to git will.
+# Useful, for example, when develop-olympus merges into develop automatically
+# but develop-olympus changes are not applicable to develop and the merge
+# actually should be a no-op.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+my ($branch, $pr, $target, $forward);
+
+$forward = 0;
+
+my $home = $ENV{'HOME'};
+my $state_file = "$home/.phpbb-merge-state";
+
+my $develop = '';
+my $continue = '';
+my $no_commit = '';
+
+GetOptions('develop' => \$develop, 'continue' => \$continue, 'no-commit' => \$no_commit);
+
+if ($develop || $continue) {
+    if (-e $state_file) {
+        open FH, "<$state_file" || die "Could not open $state_file: $!";
+        my $contents = <FH>;
+        close FH;
+        if ($develop) {
+            ($forward, $pr, $branch) = split ' ', $contents;
+            $forward = 1;
+            if ($branch eq 'develop-olympus') {
+                $target = 'develop';
+            } else {
+                $target = 'develop-olympus';
+            }
+        } else {
+            ($branch, $pr, $target, $forward) = split ' ', $contents;
+        }
+    }
+}
+
+if ($continue && !$branch) {
+    print "-c specified but could not determine branch\n";
+    exit 5;
+}
+
+unless ($continue) {
+    if (!$branch) {
+        ($branch, $pr, $target) = @ARGV;
+    }
+    
+    if (!$pr && $branch) {
+        my $try_pr = $branch;
+        $try_pr = 0 + $try_pr;
+        $_ = `curl -s https://api.github.com/repos/phpbb/phpbb3/pulls/$try_pr`;
+        unless ($?) {
+            if (/^\s+"label": "(?!phpbb)(.+):(.+)",?$/m) {
+                $branch = "$1/$2";
+                $pr = $try_pr;
+            }
+        }
+    }
+
+    if (!$pr) {
+        print "Usage: phpbb-merge PR\n";
+        print "Usage: phpbb-merge branch PR\n";
+        print "Usage: phpbb-merge branch PR target-branch\n";
+        print "       phpbb-merge -d\n";
+        print "       phpbb-merge -d -n\n";
+        exit 5;
+    }
+
+    if ($target and $target eq 'o' || $target eq 'olympus') {
+        $target = 'develop-olympus';
+    }
+}
+
+unless ($branch =~ /^[\w\/\-]+$/s) {
+    die "Unacceptable branch: $branch";
+}
+
+unless ($develop) {
+    my ($account) = split /\//, $branch, 2;
+    unless ($account =~ /^develop($|-)/) {
+        my $remotes = `git remote`;
+        unless ($remotes =~ /^\Q$account\E$/m) {
+            # no remote
+            print "Adding remote $account\n";
+            print `git remote add $account git://github.com/$account/phpbb3.git`;
+        }
+
+        print `git fetch $account`;
+    }
+}
+
+unless ($continue) {
+    if (!$target) {
+        $target = PHPBB::Git::determine_base($branch);
+    }
+
+    unless ($target) {
+        print "Could not determine target branch for merging\n";
+        exit 5;
+    }
+}
+
+if ($continue) {
+    print "Continuing merge of $branch into $target for PR #$pr\n";
+} else {
+    print "Merging $branch into $target for PR #$pr\n";
+}
+
+unless ($continue) {
+    my $current_branch = `git branch |grep '^\*' |awk '{print \$2}'`;
+
+    if ($current_branch ne $target) {
+        print `git checkout "$target"`;
+    }
+
+    unless ($forward && $target eq 'develop') {
+        open FH, ">$state_file" or die "Could not open state file: $!";
+        print FH "$branch $pr $target";
+        close FH;
+    }
+
+    my $options = '--no-ff';
+    if ($no_commit) {
+        $options .= ' --no-commit';
+    }
+    print `git merge $options "$branch"`;
+
+    if ($?) {
+        open FH, ">$state_file" or die "Could not open state file: $!";
+        print FH "$branch $pr $target $forward";
+        close FH;
+        print "Merge failed, fix and run phpbb-merge -c\n";
+        exit 6;
+    }
+    
+    if ($no_commit) {
+        open FH, ">$state_file" or die "Could not open state file: $!";
+        print FH "$branch $pr $target $forward";
+        close FH;
+        print "Stopping before commit, commit and run phpbb-merge -c\n";
+        exit;
+    }
+}
+
+my $sed_cmd;
+if ($forward) {
+    $sed_cmd = qq.sed -e 's/^Merge branch/Merge PR #$pr branch/'.;
+} else {
+    $sed_cmd = qq.sed -e s/remote-tracking/'PR #$pr'/.;
+}
+
+print `git filter-branch  --msg-filter "$sed_cmd" -f -- --max-count=1 HEAD`;
+
+if ($forward && $target eq 'develop') {
+    if (-e $state_file) {
+        unlink($state_file);
+    }
+}
+
+if ($forward) {
+    `git diff HEAD^..HEAD |egrep -q 'case.*(postgres|mysql|sqlite|firebird|oracle|mssql|odbc)'`;
+    if ($? == 0) {
+        print "Warning: diff includes switching on database driver.\n";
+        print "Check that driver names do not need to be changed to phpbb_db_driver_*:\n";
+        print "\n";
+    }
+    print `git diff HEAD^..HEAD |egrep 'case.*(postgres|mysql|sqlite|firebird|oracle|mssql|odbc)'`;
+}

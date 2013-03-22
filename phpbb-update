@@ -1,0 +1,46 @@
+#!/bin/sh
+
+set -e
+
+usage() {
+	echo "Usage: `basename $0` [-F] [-d]" 1>&2
+	exit 5
+}
+
+fetch=true
+develop=false
+
+while getopts :Fd option; do
+	case $option in
+	F)
+		fetch=false;;
+	d)
+		develop=true;;
+	*)
+		usage;;
+	esac
+done
+
+orig_branch=`git branch --contains HEAD |head -1 |awk '{print $2}'`
+
+if $fetch; then
+	git fetch upstream
+fi
+
+branches=`git branch |grep prep-release |cut -c 2-`
+
+for branch in $branches; do
+	git checkout "$branch"
+	git reset --hard upstream/"$branch"
+done
+
+git checkout develop-olympus
+git reset --hard upstream/develop-olympus
+git checkout develop
+git reset --hard upstream/develop
+
+if $develop; then
+	git checkout develop
+else
+	git checkout "$orig_branch"
+fi

@@ -1,0 +1,99 @@
+#!/usr/bin/env python
+
+import subprocess, re
+
+def get_files_matching(query):
+    output = subprocess.check_output(['git', 'grep', '-l', query])
+    files = output.strip().split("\n")
+    return files
+
+def extract_event_name(line):
+    match = re.search(r"'([^']+)'", line)
+    assert match
+    event_name = match.group(1)
+    return event_name
+
+def get_lines_in_file(file):
+    with open(file) as f:
+        lines = f.readlines()
+        for index in range(len(lines)):
+            line = lines[index]
+            yield line, index, lines
+
+def calculate_indent(line):
+    match = re.match(r'(\s+)', line)
+    if match:
+        indent = match.group(1)
+    else:
+        indent = ''
+    return indent
+
+class Scope(object):
+    def __init__(self):
+        self.file = self.cls = self.function = None
+
+def determine_scope(line, index, lines, file):
+    indent = calculate_indent(line)
+    scope = Scope()
+    scope.file = file
+    if len(indent) == 0:
+        # top level, must be file scope
+        pass
+    else:
+        # track which function we are in, if any
+        search_index = index - 1
+        while search_index >= 0:
+            search_line = lines[search_index]
+            match = re.match(r'\s*(?:\w+\s+)*function\s+(\w+)\(', search_line)
+            if match:
+                function = match.group(1)
+                function_indent = calculate_indent(search_line)
+                # i don't think nested functions are allowed
+                # just check the indent
+                if len(function_indent) < len(indent):
+                    # might be in the function, find its end
+                    end = function_indent + '}'
+                    search_index += 1
+                    while search_index < index:
+                        line = lines[search_index]
+                        if line.startswith(end):
+                            # function ended before our event
+                            # assume event is at global scope
+                            break
+                        search_index += 1
+                
+                # if we get here we are presumably in the function
+                scope.function = function
+                break
+            search_index -= 1
+    parts = []
+    if scope.function:
+        parts.append('function: %s' % scope.function)
+    parts.append('file: %s' % scope.file)
+    return ', '.join(parts)
+
+for file in get_files_matching("trigger_event('"):
+    for line, index, lines in get_lines_in_file(file):
+        if line.find("trigger_event('") >= 0 and line.strip().find('extract') == 0:
+            event_name = extract_event_name(line)
+            search_index = index - 1
+            vars = None
+            while search_index >= 0:
+                search_line = lines[search_index]
+                if search_line.strip().find('$vars = array') == 0:
+                    # vars could be empty
+                    match = re.search("'.*'", search_line)
+                    assert match
+                    vars = [var.strip()[1:-1] for var in match.group(0).split(',')]
+                    break
+                search_index -= 1
+            assert vars is not None
+            scope = determine_scope(line, index, lines, file)
+            print event_name, '(' + ', '.join(vars) + ')', scope
+
+for file in get_files_matching("phpbb_dispatcher->dispatch('"):
+    for line, index, lines in get_lines_in_file(file):
+        if line.find('dispatcher->dispatch') >= 0 and line.strip().find('$phpbb_dispatcher') == 0:
+            event_name = extract_event_name(line)
+            scope = determine_scope(line, index, lines, file)
+            print event_name, scope

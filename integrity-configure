@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+
+# When firefox submits forms, it sends newlines as \r\n.
+# This screws up build commands that span multiple lines,
+# including quoted strings spanning multiple lines.
+# Therefore each line should be its own command.
+
+use strict;
+use warnings;
+
+my $host = "http://integrity.vps.hxr.me";
+my @dbs = qw(mysql mysqli postgres);
+my @branches = qw(develop olympus);
+my %branch_map = ('olympus', 'develop-olympus');
+my @repos = qw(p upstream);
+my %repo_map = ('upstream', 'phpbb');
+
+for my $repo (@repos) {
+    my $ghrepo = $repo_map{$repo} || $repo;
+    for my $branch (@branches) {
+        my $ghbranch = $branch_map{$branch} || $branch;
+        for my $db (@dbs) {
+            my $pname = "$repo-wolis-$branch-$db";
+            my $prepo = "git://github.com/p/wolis";
+            my $pbranch = "master";
+            my $pscript = <<EOT;
+virtualenv venv &&
+. ./venv/bin/activate &&
+pip install -r requirements.txt &&
+./script/run -c config/vps.yaml -s git://github.com/$ghrepo/phpbb3 -b $ghbranch -d $db
+EOT
+            create_or_update($pname, $prepo, $pbranch, $pscript);
+            
+            $pname = "$repo-unit-$branch-$db";
+            $prepo = "git://github.com/$ghrepo/phpbb3";
+            $pbranch = $ghbranch;
+            $pscript = <<EOT;
+git cclone git://github.com/p/phpunit-bundle phpunit-bundle &&
+cd phpBB &&
+php ../composer.phar install --dev &&
+cd .. &&
+export PHPBB_TEST_DBNAME=phpbbtest &&
+export PHPBB_TEST_DBHOST=127.0.0.1 &&
+export PHPBB_TEST_DBUSER=phpbbtest &&
+export PHPBB_TEST_DBPASSWD=phpbbtest &&
+export PHPBB_TEST_DBMS=$db &&
+php -d include_path=.:`pwd`/phpunit-bundle phpunit-bundle/phpunit.php -c phpunit.xml.dist --verbose
+EOT
+            create_or_update($pname, $prepo, $pbranch, $pscript);
+            
+            $pname =~ s/unit-/functional-/;
+            $pscript =~ s/phpunit.xml.dist/phpunit.xml.functional/;
+            create_or_update($pname, $prepo, $pbranch, $pscript);
+        }
+        
+        my $db = 'nodb';
+        my $pname = "$repo-unit-$branch-$db";
+        my $prepo = "git://github.com/$repo/phpbb3";
+        my $pbranch = $branch;
+        my $pscript = <<EOT;
+git cclone git://github.com/p/phpunit-bundle phpunit-bundle &&
+cd phpBB &&
+php ../composer.phar install --dev &&
+cd .. &&
+php -d include_path=.:`pwd`/phpunit-bundle phpunit-bundle/phpunit.php -c phpunit.xml.dist --verbose
+EOT
+        create_or_update($pname, $prepo, $pbranch, $pscript);
+    }
+}
+
+sub create_or_update {
+    my ($pname, $prepo, $pbranch, $pscript) = @_;
+    $prepo = urlencode($prepo);
+    $pbranch = urlencode($pbranch);
+    $pscript = urlencode($pscript);
+    my $query = "project_data[name]=$pname&project_data[uri]=$prepo&project_data[branch]=$pbranch&project_data[command]=$pscript&project_data[public]=1";
+    
+    `curl -fsn $host/$pname`;
+    if ($? == 0) {
+        # exists
+        print "$pname exists\n";
+        print `curl -snX PUT -d '$query' $host/$pname`;
+    } else {
+        # does not exist
+        print "$pname does not exist\n";
+        print `curl -snX POST -d '$query' $host/`;
+    }
+}
+
+sub urlencode {
+    my $s = shift;
+    $s =~ s/ /+/g;
+    $s =~ s/([^A-Za-z0-9\+-])/sprintf("%%%02X", ord($1))/seg;
+    return $s;
+}
